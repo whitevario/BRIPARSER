@@ -3,10 +3,14 @@ import pandas as pd
 import re
 import io
 
+# ==== IMPORT PDF LIBRARIES ====
+import pdfplumber
+import PyPDF2
+
 # ==== KONFIGURASI ====
-st.set_page_config(page_title="BRIVA Filter Tool", layout="wide")
+st.set_page_config(page_title="BRIVA Filter Tool - Support Excel & PDF", layout="wide")
 st.title("🔍 BRIVA Transaction Filter")
-st.markdown("Upload rekening koran (Excel) dan dapatkan transaksi BRIVA yang valid")
+st.markdown("Upload **Rekening Koran (Excel/PDF)** dan dapatkan transaksi BRIVA yang valid")
 
 # ==== LOAD PREFIX ====
 @st.cache_data
@@ -18,7 +22,129 @@ def load_prefixes(uploaded_file):
         return prefixes
     return []
 
-# ==== AMBIL BRIVA DARI REMARK ====
+# ==== EKSTRAK TEKS DARI PDF ====
+def ekstrak_teks_pdf_pypdf2(uploaded_file):
+    """Ekstrak teks dari PDF menggunakan PyPDF2"""
+    reader = PyPDF2.PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+def ekstrak_teks_pdf_pdfplumber(uploaded_file):
+    """Ekstrak teks dari PDF menggunakan pdfplumber (lebih akurat)"""
+    text = ""
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text()
+    return text
+
+def ekstrak_teks_pdf(uploaded_file):
+    """Coba ekstrak dengan pdfplumber dulu, fallback ke PyPDF2"""
+    try:
+        # Reset file pointer
+        uploaded_file.seek(0)
+        text = ekstrak_teks_pdf_pdfplumber(uploaded_file)
+        if text.strip():
+            return text
+    except:
+        pass
+    
+    try:
+        uploaded_file.seek(0)
+        text = ekstrak_teks_pdf_pypdf2(uploaded_file)
+        return text
+    except Exception as e:
+        st.error(f"Gagal ekstrak PDF: {e}")
+        return ""
+
+# ==== EKSTRAK TRANSAKSI DARI TEKS PDF ====
+def ekstrak_transaksi_dari_teks(text, prefixes):
+    """
+    Ambil transaksi dari teks PDF
+    Format umum di rekening koran PDF:
+    Tanggal Waktu Uraian Debet Kredit Saldo
+    """
+    lines = text.split('\n')
+    transaksi = []
+    
+    # Pattern untuk date (format: 21/04/26 atau 21-04-26)
+    date_pattern = r'(\d{2}[/\-]\d{2}[/\-]\d{2})'
+    # Pattern untuk waktu (HH:MM:SS)
+    time_pattern = r'(\d{2}:\d{2}:\d{2})'
+    # Pattern untuk nominal (contoh: 40,000,000.00 atau 40.000.000)
+    nominal_pattern = r'[\d\.,]+'
+    
+    for line in lines:
+        # Cari tanggal di awal line
+        date_match = re.search(date_pattern, line)
+        if date_match:
+            tanggal = date_match.group(1)
+            
+            # Cari waktu
+            time_match = re.search(time_pattern, line)
+            waktu = time_match.group(1) if time_match else "00:00:00"
+            
+            # Cari BRIVA di dalam line
+            briva = ambil_briva_from_text(line, prefixes)
+            
+            # Cari nominal (debet/kredit)
+            nominal_matches = re.findall(nominal_pattern, line)
+            debet = 0
+            kredit = 0
+            
+            # Parse nominal (ambil 2 nominal terakhir biasanya)
+            for nom in nominal_matches:
+                nom_clean = bersihkan_nominal_pdf(nom)
+                if nom_clean > 0:
+                    if "debet" in line.lower() or "debit" in line.lower():
+                        debet = nom_clean
+                    elif "kredit" in line.lower() or "credit" in line.lower():
+                        kredit = nom_clean
+                    else:
+                        # Jika tidak ada label, asumsikan kredit
+                        kredit = nom_clean
+            
+            if briva or debet > 0 or kredit > 0:
+                transaksi.append({
+                    'TANGGAL': tanggal,
+                    'WAKTU': waktu,
+                    'REMARK': line,
+                    'BRIVA': briva,
+                    'DEBET': debet,
+                    'KREDIT': kredit
+                })
+    
+    return pd.DataFrame(transaksi)
+
+def ambil_briva_from_text(text, prefixes):
+    """Ambil nomor BRIVA dari text (tanpa harus hapus non-digit dulu)"""
+    # Pattern untuk BRIVA (5 digit prefix + 10 digit)
+    for prefix in prefixes:
+        pattern = prefix + r'\d{10}'
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return None
+
+def bersihkan_nominal_pdf(nominal_str):
+    """Bersihkan nominal dari PDF (format: 40,000,000.00 atau 40.000.000)"""
+    if not nominal_str:
+        return 0
+    # Hapus koma (pemisah ribuan)
+    s = nominal_str.replace(',', '')
+    # Hapus .00 di akhir
+    s = re.sub(r'\.00$', '', s)
+    # Hapus titik pemisah ribuan
+    s = s.replace('.', '')
+    # Hanya ambil digit
+    s = re.sub(r'[^\d]', '', s)
+    try:
+        return int(s)
+    except:
+        return 0
+
+# ==== AMBIL BRIVA DARI REMARK (Excel) ====
 def ambil_briva(remark, prefixes):
     text = str(remark)
     text = re.sub(r"[^0-9]", "", text)
@@ -28,7 +154,7 @@ def ambil_briva(remark, prefixes):
             return match.group(0)
     return None
 
-# ==== BERSIHKAN NOMINAL ====
+# ==== BERSIHKAN NOMINAL (Excel) ====
 def bersihkan_nominal(x):
     if pd.isna(x):
         return 0
@@ -48,7 +174,7 @@ def bersihkan_nominal(x):
     except:
         return 0
 
-# ==== BACA REKENING KORAN ====
+# ==== BACA REKENING KORAN EXCEL ====
 def baca_rekening_koran(uploaded_file):
     df_raw = pd.read_excel(uploaded_file, header=None)
     header_row = None
@@ -81,7 +207,70 @@ def baca_rekening_koran(uploaded_file):
     df = df.rename(columns=kolom_mapping)
     return df
 
-# ==== SIDE BAR: UPLOAD PREFIX ====
+# ==== PROSES EXCEL ====
+def proses_excel(file, prefixes):
+    df = baca_rekening_koran(file)
+    if df is None:
+        return None, None
+    
+    if not all(col in df.columns for col in ['TANGGAL', 'REMARK', 'DEBET', 'KREDIT']):
+        st.error(f"Kolom tidak lengkap di {file.name}")
+        return None, None
+    
+    df['DEBET'] = df['DEBET'].apply(bersihkan_nominal)
+    df['KREDIT'] = df['KREDIT'].apply(bersihkan_nominal)
+    df['BRIVA'] = df['REMARK'].apply(lambda x: ambil_briva(x, prefixes))
+    df['TIPE'] = df.apply(
+        lambda row: "MASUK" if row['KREDIT'] > 0 else ("KELUAR" if row['DEBET'] > 0 else ""),
+        axis=1
+    )
+    df['ASAL_FILE'] = file.name
+    
+    df_match = df[df['BRIVA'].notna() & df['BRIVA'].str[:5].isin(prefixes)].copy()
+    df_lain = df.drop(df_match.index).copy()
+    
+    if not df_match.empty:
+        df_match['REMARK'] = df_match['BRIVA']
+    
+    return df_match, df_lain
+
+# ==== PROSES PDF ====
+def proses_pdf(file, prefixes):
+    # Ekstrak teks dari PDF
+    text = ekstrak_teks_pdf(file)
+    if not text:
+        st.error(f"Tidak bisa ekstrak teks dari {file.name}")
+        return None, None
+    
+    # Ekstrak transaksi dari teks
+    df = ekstrak_transaksi_dari_teks(text, prefixes)
+    if df.empty:
+        st.warning(f"Tidak ada transaksi yang ditemukan di {file.name}")
+        return None, None
+    
+    df['TIPE'] = df.apply(
+        lambda row: "MASUK" if row['KREDIT'] > 0 else ("KELUAR" if row['DEBET'] > 0 else ""),
+        axis=1
+    )
+    df['ASAL_FILE'] = file.name
+    
+    df_match = df[df['BRIVA'].notna() & df['BRIVA'].str[:5].isin(prefixes)].copy()
+    df_lain = df.drop(df_match.index).copy()
+    
+    if not df_match.empty:
+        df_match['REMARK'] = df_match['BRIVA']
+    
+    # Kolom output standar
+    kolom_standar = ['TANGGAL', 'WAKTU', 'REMARK', 'DEBET', 'KREDIT', 'TIPE', 'ASAL_FILE']
+    for col in kolom_standar:
+        if col not in df_match.columns and col != 'WAKTU':
+            df_match[col] = ''
+        if col not in df_lain.columns and col != 'WAKTU':
+            df_lain[col] = ''
+    
+    return df_match, df_lain
+
+# ==== SIDEBAR: UPLOAD PREFIX ====
 st.sidebar.header("📂 1. Upload Corporate Code")
 prefix_file = st.sidebar.file_uploader(
     "Upload corporate_code.xlsx / .xls",
@@ -91,81 +280,50 @@ prefix_file = st.sidebar.file_uploader(
 if prefix_file:
     prefixes = load_prefixes(prefix_file)
     st.sidebar.success(f"✅ {len(prefixes)} prefix loaded")
-    st.sidebar.write("Prefix:", prefixes[:5], "..." if len(prefixes) > 5 else "")
+    with st.sidebar.expander("Lihat daftar prefix"):
+        st.write(prefixes)
 else:
     st.sidebar.warning("⚠️ Upload file corporate_code terlebih dahulu")
     st.stop()
 
-# ==== MAIN AREA: UPLOAD REK KORAN ====
-st.header("📄 2. Upload Rekening Koran")
+# ==== MAIN AREA: UPLOAD FILE ====
+st.header("📄 2. Upload Rekening Koran (Excel atau PDF)")
 uploaded_files = st.file_uploader(
-    "Upload satu atau lebih file Excel rekening koran",
-    type=["xlsx", "xls"],
+    "Upload satu atau lebih file (Excel .xlsx/.xls atau PDF)",
+    type=["xlsx", "xls", "pdf"],
     accept_multiple_files=True
 )
 
 if not uploaded_files:
-    st.info("Silakan upload file rekening koran")
+    st.info("Silakan upload file rekening koran (Excel atau PDF)")
     st.stop()
 
 # ==== PROSES SEMUA FILE ====
 all_match = []
 all_lain = []
+progress_bar = st.progress(0)
 
-for file in uploaded_files:
+for i, file in enumerate(uploaded_files):
     st.markdown(f"### 📁 {file.name}")
+    st.write(f"**Tipe:** {file.type}")
     
-    # Baca file
-    try:
-        df = baca_rekening_koran(file)
-        if df is None:
-            st.error(f"Gagal membaca {file.name}")
-            continue
-    except Exception as e:
-        st.error(f"Error membaca {file.name}: {e}")
-        continue
-
-    # Cek kolom yang diperlukan
-    if not all(col in df.columns for col in ['TANGGAL', 'REMARK', 'DEBET', 'KREDIT']):
-        st.error(f"Kolom tidak lengkap di {file.name}")
-        continue
-
-    # Bersihkan nominal
-    df['DEBET'] = df['DEBET'].apply(bersihkan_nominal)
-    df['KREDIT'] = df['KREDIT'].apply(bersihkan_nominal)
-
-    # Ambil BRIVA
-    df['BRIVA'] = df['REMARK'].apply(lambda x: ambil_briva(x, prefixes))
-
-    # Tentukan tipe
-    df['TIPE'] = df.apply(
-        lambda row: "MASUK" if row['KREDIT'] > 0 else ("KELUAR" if row['DEBET'] > 0 else ""),
-        axis=1
-    )
-
-    df['ASAL_FILE'] = file.name
-
-    # Pisahkan match vs lain
-    df_match = df[df['BRIVA'].notna() & df['BRIVA'].str[:5].isin(prefixes)].copy()
-    df_lain = df.drop(df_match.index).copy()
-
-    # Ganti remark dengan BRIVA untuk yg match
-    if not df_match.empty:
-        df_match['REMARK'] = df_match['BRIVA']
-
-    # Simpan ke rekap
-    all_match.append(df_match)
-    all_lain.append(df_lain)
-
-    # Tampilkan preview
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("✅ BRIVA MATCH", len(df_match))
-    with col2:
-        st.metric("📄 LAIN-LAIN", len(df_lain))
-
-    if not df_match.empty:
-        st.dataframe(df_match[['TANGGAL', 'REMARK', 'DEBET', 'KREDIT', 'TIPE']].head(10))
+    if file.type == "application/pdf":
+        df_match, df_lain = proses_pdf(file, prefixes)
+    else:
+        df_match, df_lain = proses_excel(file, prefixes)
+    
+    if df_match is not None and not df_match.empty:
+        all_match.append(df_match)
+        st.success(f"✅ BRIVA MATCH: {len(df_match)} transaksi")
+        st.dataframe(df_match[['TANGGAL', 'REMARK', 'DEBET', 'KREDIT', 'TIPE']].head(5))
+    else:
+        st.info("📭 Tidak ada transaksi BRIVA yang ditemukan")
+    
+    if df_lain is not None and not df_lain.empty:
+        all_lain.append(df_lain)
+        st.info(f"📄 LAIN-LAIN: {len(df_lain)} transaksi")
+    
+    progress_bar.progress((i + 1) / len(uploaded_files))
 
 # ==== GABUNG & DOWNLOAD ====
 st.header("📥 3. Download Hasil")
@@ -185,7 +343,7 @@ if all_match or all_lain:
         if prefix_file:
             df_prefix_display = pd.DataFrame({"corporate_code": prefixes})
             df_prefix_display.to_excel(writer, index=False, sheet_name='PREFIX_LIST')
-
+    
     st.download_button(
         label="💾 Download Rekap BRIVA.xlsx",
         data=output.getvalue(),
